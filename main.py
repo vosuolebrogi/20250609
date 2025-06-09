@@ -91,6 +91,78 @@ class ImageAnalyzer:
         except Exception:
             return False
 
+    def parse_analysis_results(self, analysis_text: str) -> dict:
+        """Парсит результаты анализа в структурированный формат"""
+        results = {
+            'realistic_photo': 'unknown',
+            'illustration': 'unknown', 
+            'main_object': 'unknown',
+            'background_color': 'unknown',
+            'discount_message': 'unknown'
+        }
+        
+        lines = analysis_text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('а.'):
+                results['realistic_photo'] = 'yes' if 'да' in line.lower() else 'no'
+            elif line.startswith('б.'):
+                results['illustration'] = 'yes' if 'да' in line.lower() else 'no'
+            elif line.startswith('в.'):
+                # Извлекаем основной объект после "в."
+                obj_text = line[2:].strip().lower()
+                if 'люди' in obj_text or 'человек' in obj_text:
+                    results['main_object'] = 'people'
+                elif any(word in obj_text for word in ['телефон', 'компьютер', 'машина', 'автомобиль']):
+                    results['main_object'] = 'tech'
+                elif any(word in obj_text for word in ['еда', 'продукт', 'товар', 'одежда']):
+                    results['main_object'] = 'product'
+                else:
+                    # Берем первое слово как основной объект
+                    words = obj_text.split()
+                    if words:
+                        results['main_object'] = words[0][:10]  # Ограничиваем длину
+            elif line.startswith('г.'):
+                color_text = line[2:].strip().lower()
+                colors_map = {
+                    'белый': 'white', 'черный': 'black', 'красный': 'red',
+                    'синий': 'blue', 'зеленый': 'green', 'желтый': 'yellow',
+                    'серый': 'gray', 'коричневый': 'brown', 'розовый': 'pink'
+                }
+                for ru_color, en_color in colors_map.items():
+                    if ru_color in color_text:
+                        results['background_color'] = en_color
+                        break
+                else:
+                    # Если не нашли стандартный цвет, берем первое слово
+                    words = color_text.split()
+                    if words:
+                        results['background_color'] = words[0][:8]
+            elif line.startswith('д.'):
+                results['discount_message'] = 'yes' if 'да' in line.lower() else 'no'
+        
+        return results
+
+    def create_new_filename(self, original_filename: str, analysis_results: dict) -> str:
+        """Создает новое имя файла на основе результатов анализа"""
+        # Получаем расширение файла
+        name, ext = os.path.splitext(original_filename)
+        
+        # Создаем компактную схему именования
+        # Формат: R[0/1]-I[0/1]-[obj]-[color]-S[0/1]_original
+        photo = '1' if analysis_results['realistic_photo'] == 'yes' else '0'
+        illus = '1' if analysis_results['illustration'] == 'yes' else '0'
+        obj = analysis_results['main_object']
+        color = analysis_results['background_color']
+        sale = '1' if analysis_results['discount_message'] == 'yes' else '0'
+        
+        # Очищаем имя от специальных символов
+        clean_name = "".join(c for c in name if c.isalnum() or c in ('-', '_'))[:20]
+        
+        new_name = f"R{photo}-I{illus}-{obj}-{color}-S{sale}_{clean_name}{ext}"
+        
+        return new_name
+
 class TelegramBot:
     def __init__(self):
         self.analyzer = ImageAnalyzer()
@@ -109,9 +181,18 @@ class TelegramBot:
 г. Основной цвет фона
 д. Есть ли сообщение о скидке?
 
-📝 *Как использовать:*
-1. Отправьте ZIP архив с изображениями (JPG/PNG)
-2. Получите структурированный анализ каждого изображения
+📝 *Что получите:*
+1. Структурированный анализ каждого изображения
+2. Переименованный ZIP архив с новыми названиями файлов
+3. README файл с расшифровкой схемы именования
+
+🚀 *Схема именования:*
+`R1-I0-people-blue-S0_original.jpg`
+• R1 = реалистичное фото
+• I0 = не иллюстрация  
+• people = основной объект
+• blue = цвет фона
+• S0 = нет скидки
 
 ⚠️ *Ограничения:*
 • Максимальный размер файла: 20MB
@@ -205,14 +286,21 @@ class TelegramBot:
             
             # Анализируем изображения
             results = []
+            images_with_analysis = []  # Для создания переименованного архива
+            
             for i, (filename, image_data) in enumerate(images, 1):
                 await processing_message.edit_text(f"🔍 Анализирую изображение {i}/{len(images)}: {filename}")
                 
                 description = await self.analyzer.analyze_image(image_data, filename)
                 results.append((filename, description))
+                images_with_analysis.append((filename, image_data, description))
                 
                 # Небольшая задержка для избежания rate limit
                 await asyncio.sleep(0.5)
+            
+            # Создаем переименованный ZIP архив
+            await processing_message.edit_text("📦 Создаю переименованный архив...")
+            renamed_zip_data = await self.create_renamed_zip(images_with_analysis)
             
             # Форматируем результаты в таблицу
             await processing_message.edit_text("📊 Формирую результаты...")
@@ -228,6 +316,26 @@ class TelegramBot:
                     await update.message.reply_text(part, parse_mode=ParseMode.MARKDOWN)
             else:
                 await update.message.reply_text(table, parse_mode=ParseMode.MARKDOWN)
+            
+            # Отправляем переименованный ZIP архив
+            await update.message.reply_text(
+                "📤 *Переименованный архив готов к скачиванию!*\n\n"
+                "📁 Файлы переименованы согласно результатам анализа\n"
+                "📋 В архиве есть README с расшифровкой схемы именования",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Создаем имя для нового архива
+            original_name = document.file_name.replace('.zip', '')
+            new_archive_name = f"{original_name}_analyzed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            
+            # Отправляем архив
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=io.BytesIO(renamed_zip_data),
+                filename=new_archive_name,
+                caption="📂 Переименованные изображения с анализом"
+            )
                 
         except Exception as e:
             logger.error(f"Ошибка при обработке ZIP файла: {e}")
@@ -296,6 +404,52 @@ class TelegramBot:
             parts.append(current_part.strip())
         
         return parts
+
+    async def create_renamed_zip(self, images_with_analysis: List[Tuple[str, bytes, str]]) -> bytes:
+        """Создает ZIP архив с переименованными файлами"""
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            used_names = set()  # Для избежания дублирования имен
+            
+            for i, (original_filename, image_data, analysis_text) in enumerate(images_with_analysis):
+                # Парсим результаты анализа
+                analysis_results = self.analyzer.parse_analysis_results(analysis_text)
+                
+                # Создаем новое имя файла
+                new_filename = self.analyzer.create_new_filename(original_filename, analysis_results)
+                
+                # Проверяем на дублирование и добавляем номер если нужно
+                original_new_filename = new_filename
+                counter = 1
+                while new_filename in used_names:
+                    name, ext = os.path.splitext(original_new_filename)
+                    new_filename = f"{name}_{counter:03d}{ext}"
+                    counter += 1
+                
+                used_names.add(new_filename)
+                
+                # Добавляем файл в архив
+                zip_file.writestr(new_filename, image_data)
+            
+            # Добавляем файл с расшифровкой схемы именования
+            readme_content = """Схема именования файлов:
+
+R[0/1] - Реалистичное фото (1=да, 0=нет)
+I[0/1] - Иллюстрация (1=да, 0=нет)  
+[obj] - Основной объект (people/tech/product/другое)
+[color] - Цвет фона (white/black/red/blue/и т.д.)
+S[0/1] - Скидка/выгода (1=да, 0=нет)
+
+Пример: R1-I0-people-blue-S0_photo123.jpg
+Означает: реалистичное фото, не иллюстрация, люди, синий фон, нет скидки
+
+Создано ботом анализа изображений
+"""
+            zip_file.writestr("README_naming_scheme.txt", readme_content)
+        
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
 
 def main():
     """Главная функция запуска бота"""
