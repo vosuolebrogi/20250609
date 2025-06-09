@@ -262,7 +262,7 @@ class TelegramBot:
         
         return parts
 
-async def main():
+def main():
     """Главная функция запуска бота"""
     # Проверяем наличие необходимых токенов
     telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -296,7 +296,7 @@ async def main():
     
     # Запускаем бота
     logger.info("Запускаем бота...")
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    asyncio.run(main()) 
+    main() 
