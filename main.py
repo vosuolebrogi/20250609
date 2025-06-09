@@ -29,7 +29,8 @@ openai_client = AsyncOpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
 # Константы
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
-SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png'}
+SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png', '.gif'}
+MAX_GIF_FRAMES = 5  # Максимум кадров для анализа в GIF
 
 class ImageAnalyzer:
     def __init__(self):
@@ -38,6 +39,15 @@ class ImageAnalyzer:
     async def analyze_image(self, image_data: bytes, filename: str) -> str:
         """Анализирует изображение с помощью OpenAI Vision API по заданным критериям"""
         try:
+            # Проверяем, является ли файл GIF
+            if filename.lower().endswith('.gif'):
+                frames = self.extract_gif_frames(image_data)
+                if frames:
+                    return await self.analyze_gif_frames(frames, filename)
+                else:
+                    return "Ошибка: не удалось извлечь кадры из GIF файла"
+            
+            # Для обычных изображений (JPG, PNG)
             # Конвертируем изображение в base64
             base64_image = base64.b64encode(image_data).decode('utf-8')
             
@@ -90,6 +100,135 @@ class ImageAnalyzer:
             return True
         except Exception:
             return False
+
+    def extract_gif_frames(self, gif_data: bytes) -> List[bytes]:
+        """Извлекает ключевые кадры из GIF анимации"""
+        frames = []
+        try:
+            with Image.open(io.BytesIO(gif_data)) as gif:
+                if not getattr(gif, 'is_animated', False):
+                    # Если это не анимированный GIF, обрабатываем как обычное изображение
+                    gif_copy = gif.copy()
+                    frame_buffer = io.BytesIO()
+                    gif_copy.save(frame_buffer, format='PNG')
+                    frames.append(frame_buffer.getvalue())
+                    return frames
+                
+                frame_count = getattr(gif, 'n_frames', 1)
+                
+                # Выбираем кадры равномерно по всей анимации
+                step = max(1, frame_count // MAX_GIF_FRAMES)
+                selected_frames = list(range(0, frame_count, step))[:MAX_GIF_FRAMES]
+                
+                for frame_idx in selected_frames:
+                    gif.seek(frame_idx)
+                    # Конвертируем в RGB если нужно
+                    frame = gif.convert('RGB')
+                    
+                    # Сохраняем кадр в PNG формате
+                    frame_buffer = io.BytesIO()
+                    frame.save(frame_buffer, format='PNG')
+                    frames.append(frame_buffer.getvalue())
+                    
+        except Exception as e:
+            logger.warning(f"Ошибка при извлечении кадров GIF: {e}")
+            
+        return frames
+
+    async def analyze_gif_frames(self, frames: List[bytes], filename: str) -> str:
+        """Анализирует кадры GIF с игнорированием дисклеймеров"""
+        if not frames:
+            return "Ошибка: не удалось извлечь кадры из GIF"
+        
+        try:
+            # Анализируем каждый кадр
+            frame_analyses = []
+            
+            for i, frame_data in enumerate(frames):
+                base64_image = base64.b64encode(frame_data).decode('utf-8')
+                
+                response = await self.openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": f"""Проанализируйте кадр {i+1} из GIF анимации по следующим критериям. ВАЖНО: игнорируйте любые дисклеймеры, юридические уведомления, мелкий текст с правовой информацией, предупреждения о рисках.
+
+а. Есть ли на картинке реалистичное фото? (да/нет)
+б. Есть ли на картинке иллюстрация? (да/нет) 
+в. Что изображено на картинке крупнее всего: люди или какие именно предметы?
+г. Каков основной цвет фона?
+д. Содержится ли на картинке сообщение о скидке или выгоде? (да/нет, игнорируйте юридические дисклеймеры)
+
+Ответьте строго по формату:
+а. [ответ]
+б. [ответ]
+в. [ответ]
+г. [ответ]
+д. [ответ]"""
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{base64_image}"
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    max_tokens=200
+                )
+                
+                frame_analysis = response.choices[0].message.content.strip()
+                frame_analyses.append(f"Кадр {i+1}:\n{frame_analysis}")
+                
+                # Небольшая задержка между запросами
+                await asyncio.sleep(0.3)
+            
+            # Объединяем анализ всех кадров и делаем общий вывод
+            combined_analysis = await self.combine_frame_analyses(frame_analyses, filename)
+            return combined_analysis
+            
+        except Exception as e:
+            logger.error(f"Ошибка при анализе GIF {filename}: {e}")
+            return f"Ошибка при анализе GIF: {str(e)}"
+
+    async def combine_frame_analyses(self, frame_analyses: List[str], filename: str) -> str:
+        """Объединяет анализ кадров в общий результат"""
+        try:
+            combined_text = "\n\n".join(frame_analyses)
+            
+            response = await self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"""На основе анализа {len(frame_analyses)} кадров GIF анимации, дайте ОБЩИЙ итоговый анализ по тем же критериям. Учитывайте доминирующие характеристики по всем кадрам:
+
+{combined_text}
+
+Дайте итоговый ответ по формату:
+а. [общий ответ по всем кадрам]
+б. [общий ответ по всем кадрам]
+в. [что доминирует по всем кадрам]
+г. [преобладающий цвет фона]
+д. [есть ли промо-контент, игнорируя дисклеймеры]"""
+                    }
+                ],
+                max_tokens=150
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            logger.error(f"Ошибка при объединении анализа кадров для {filename}: {e}")
+            # Возвращаем анализ первого кадра как fallback
+            if frame_analyses:
+                return frame_analyses[0]
+            return "Ошибка при объединении анализа кадров"
 
     def parse_analysis_results(self, analysis_text: str) -> dict:
         """Парсит результаты анализа в структурированный формат"""
@@ -149,7 +288,7 @@ class ImageAnalyzer:
         name, ext = os.path.splitext(original_filename)
         
         # Создаем компактную схему именования
-        # Формат: R[0/1]-I[0/1]-[obj]-[color]-S[0/1]_original
+        # Формат: [GIF-]R[0/1]-I[0/1]-[obj]-[color]-S[0/1]_original
         photo = '1' if analysis_results['realistic_photo'] == 'yes' else '0'
         illus = '1' if analysis_results['illustration'] == 'yes' else '0'
         obj = analysis_results['main_object']
@@ -159,7 +298,10 @@ class ImageAnalyzer:
         # Очищаем имя от специальных символов
         clean_name = "".join(c for c in name if c.isalnum() or c in ('-', '_'))[:20]
         
-        new_name = f"R{photo}-I{illus}-{obj}-{color}-S{sale}_{clean_name}{ext}"
+        # Добавляем префикс для GIF файлов
+        gif_prefix = "GIF-" if ext.lower() == '.gif' else ""
+        
+        new_name = f"{gif_prefix}R{photo}-I{illus}-{obj}-{color}-S{sale}_{clean_name}{ext}"
         
         return new_name
 
@@ -188,15 +330,22 @@ class TelegramBot:
 
 🚀 *Схема именования:*
 `R1-I0-people-blue-S0_original.jpg`
+`GIF-R0-I1-tech-white-S1_banner.gif`
 • R1 = реалистичное фото
 • I0 = не иллюстрация  
 • people = основной объект
 • blue = цвет фона
 • S0 = нет скидки
+• GIF- = префикс для анимации
+
+🎞️ *GIF анимации:*
+• Анализ по ключевым кадрам (макс. 5)
+• Игнорирование юридических дисклеймеров
+• Общий анализ по всей анимации
 
 ⚠️ *Ограничения:*
 • Максимальный размер файла: 20MB
-• Поддерживаемые форматы: JPG, JPEG, PNG
+• Поддерживаемые форматы: JPG, JPEG, PNG, GIF
 • Максимум 10 изображений за раз
 
 Просто отправьте ZIP файл для начала анализа!
@@ -289,7 +438,10 @@ class TelegramBot:
             images_with_analysis = []  # Для создания переименованного архива
             
             for i, (filename, image_data) in enumerate(images, 1):
-                await processing_message.edit_text(f"🔍 Анализирую изображение {i}/{len(images)}: {filename}")
+                if filename.lower().endswith('.gif'):
+                    await processing_message.edit_text(f"🎞️ Анализирую GIF анимацию {i}/{len(images)}: {filename}\n(анализ кадров может занять больше времени)")
+                else:
+                    await processing_message.edit_text(f"🔍 Анализирую изображение {i}/{len(images)}: {filename}")
                 
                 description = await self.analyzer.analyze_image(image_data, filename)
                 results.append((filename, description))
@@ -441,8 +593,19 @@ I[0/1] - Иллюстрация (1=да, 0=нет)
 [color] - Цвет фона (white/black/red/blue/и т.д.)
 S[0/1] - Скидка/выгода (1=да, 0=нет)
 
-Пример: R1-I0-people-blue-S0_photo123.jpg
-Означает: реалистичное фото, не иллюстрация, люди, синий фон, нет скидки
+Для GIF анимаций добавляется префикс "GIF-"
+Анализ GIF проводится по ключевым кадрам (макс. 5 кадров)
+Юридические дисклеймеры и предупреждения игнорируются
+
+Примеры:
+- R1-I0-people-blue-S0_photo123.jpg (обычное фото)
+- GIF-R0-I1-tech-white-S1_banner.gif (GIF анимация)
+
+Означает: 
+- реалистичное фото/иллюстрация
+- люди/техника как основной объект
+- синий/белый фон
+- нет/есть скидки/промо
 
 Создано ботом анализа изображений
 """
